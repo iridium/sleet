@@ -512,13 +512,10 @@ mod mirror_completeness {
                     match mirror::sync_pass(&source, &dest, "dr", &settings, None).await {
                         Ok(outcome) => match &mut tail {
                             Some(t) => t.advance_floor(outcome.next_wal_sst_id),
-                            None => {
-                                tail = Some(
-                                    pass::Tail::start(&dest, outcome.next_wal_sst_id)
-                                        .await
-                                        .unwrap(),
-                                )
-                            }
+                            None => match pass::Tail::start(&dest, outcome.next_wal_sst_id).await {
+                                Ok(started) => tail = Some(started),
+                                Err(_) => faulted_ops += 1,
+                            },
                         },
                         Err(_) => faulted_ops += 1,
                     }

@@ -101,7 +101,7 @@ Sleet runs four service types:
 | `gc`                    | Runs SlateDB garbage collection for the database.                            |
 | `compactor-coordinator` | Schedules compactions and commits completed results.                         |
 | `compaction-workers`    | Claims and executes SlateDB compaction jobs.                                 |
-| `mirror`                | Copies a database to configured mirror targets and commits target manifests. |
+| `mirror`                | Copies a database, commits target manifests, and advances their read boundary. |
 
 Sleet only decides which nodes service loops run. SlateDB is responsible for
 protecting the database from concurrent access:

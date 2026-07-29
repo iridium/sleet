@@ -8,6 +8,9 @@ All notable changes to Sleet are documented in this file.
 - Upgrade SlateDB to 0.15.0. Compaction workers now use
   `heartbeat_interval`; `heartbeat_min_interval` remains a config alias, and
   the removed byte-based heartbeat setting is no longer accepted.
+- Advance each mirror target's manifest boundary after committing its head,
+  allowing SlateDB 0.15 `DbReaderMode::FollowLatest` readers to cross sparse
+  manifest gaps.
 
 ## 0.1.0 - 2026-07-10
 

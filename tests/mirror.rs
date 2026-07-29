@@ -1,7 +1,8 @@
 //! Mirror integration tests against real SlateDB databases: the sync
-//! pass invariants (RFC 0002 §3-4), the WAL tail, retention and
-//! both prune guards (§7), copiers (§8), restore, and failover by
-//! opening the target as an ordinary database (§3).
+//! pass invariants (RFC 0002 §3-4), boundary-driven readers (§5), the
+//! WAL tail, retention and both prune guards (§7), copiers (§8),
+//! restore, and failover by opening the target as an ordinary
+//! database (§3).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +10,8 @@ use std::time::Duration;
 use object_store::ObjectStoreExt;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
+use slatedb::config::DbReaderOptions;
+use slatedb::{DbReader, DbReaderMode};
 use sleet::config::{CopierKind, ResolvedMirrorTarget};
 use sleet::mirror::{self, RestorePoint, layout, pass};
 use sleet::root::Clock;
@@ -38,6 +41,18 @@ async fn names(db: &DatabaseHandle, dir: &str) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+async fn manifest_boundary(db: &DatabaseHandle) -> Option<u64> {
+    let path = layout::object_path(db, "gc/manifest.boundary");
+    match db.store.get(&path).await {
+        Ok(get) => {
+            let bytes = get.bytes().await.unwrap();
+            Some(std::str::from_utf8(&bytes).unwrap().trim().parse().unwrap())
+        }
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// The full closure of the source's latest manifest exists at the
@@ -165,6 +180,88 @@ async fn incremental_pass_copies_only_the_delta() {
         "expected a bounded delta of PUTs, got {puts}"
     );
     assert_no_live_pins(&source, "dr").await;
+}
+
+/// §5: after a sparse mirror commit, the target boundary rejects a
+/// FollowLatest reader's cached old head. SlateDB invalidates that
+/// cache, lists the gapped manifest directory, and adopts the new head.
+#[tokio::test(flavor = "multi_thread")]
+async fn follow_latest_crosses_mirror_gaps_via_boundary() {
+    let source = handle(Arc::new(InMemory::new()), "memory:///src", "src");
+    let dest = handle(Arc::new(InMemory::new()), "memory:///dst", "dst");
+    seed(&source, 1).await;
+    mirror::sync_pass(&source, &dest, "dr", &target_settings(), None)
+        .await
+        .unwrap();
+    mirror::sync_pass(&source, &dest, "dr", &target_settings(), None)
+        .await
+        .unwrap();
+
+    let reader = DbReader::builder(dest.path.clone(), dest.store.clone())
+        .with_reader_mode(DbReaderMode::FollowLatest)
+        .with_options(DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(10),
+            checkpoint_lifetime: Duration::ZERO,
+            ..DbReaderOptions::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    let old_head = reader.manifest().id();
+
+    seed(&source, 2).await;
+    let outcome = mirror::sync_pass(&source, &dest, "dr", &target_settings(), None)
+        .await
+        .unwrap();
+    assert!(
+        outcome.head > old_head + 1,
+        "the test needs a manifest gap: {old_head} -> {}",
+        outcome.head
+    );
+    assert_eq!(
+        manifest_boundary(&dest).await,
+        Some(outcome.head - 1),
+        "boundary sits immediately below the committed head"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if reader.manifest().id() >= outcome.head {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("FollowLatest reader did not cross the manifest gap");
+    assert_eq!(reader.manifest().id(), outcome.head);
+    reader.close().await.unwrap();
+}
+
+/// §4 step 2: a caught-up pass repairs the recoverable state left by a
+/// crash after the head manifest PUT but before boundary advancement.
+#[tokio::test(flavor = "multi_thread")]
+async fn caught_up_pass_repairs_missing_manifest_boundary() {
+    let source = handle(Arc::new(InMemory::new()), "memory:///src", "src");
+    let dest = handle(Arc::new(InMemory::new()), "memory:///dst", "dst");
+    seed(&source, 1).await;
+    mirror::sync_pass(&source, &dest, "dr", &target_settings(), None)
+        .await
+        .unwrap();
+    mirror::sync_pass(&source, &dest, "dr", &target_settings(), None)
+        .await
+        .unwrap();
+    let head = layout::max_manifest_id(&dest).await.unwrap().unwrap();
+    let boundary_path = layout::object_path(&dest, "gc/manifest.boundary");
+    dest.store.delete(&boundary_path).await.unwrap();
+    assert_eq!(manifest_boundary(&dest).await, None);
+
+    let outcome = mirror::sync_pass(&source, &dest, "dr", &target_settings(), None)
+        .await
+        .unwrap();
+    assert!(!outcome.committed);
+    assert_eq!(outcome.head, head);
+    assert_eq!(manifest_boundary(&dest).await, Some(head - 1));
 }
 
 /// §5: a named operator checkpoint at the source arrives in the next
@@ -686,6 +783,12 @@ async fn racing_passes_converge_safely() {
             .unwrap();
     }
     assert_mirrored(&source, &dest).await;
+    let head = layout::max_manifest_id(&dest).await.unwrap().unwrap();
+    assert_eq!(
+        manifest_boundary(&dest).await,
+        Some(head - 1),
+        "racing monotonic updates converge immediately below the head"
+    );
     assert_no_live_pins(&source, "dr").await;
 }
 

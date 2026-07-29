@@ -136,9 +136,12 @@ While a target is being mirrored:
 - source writers must be stopped before manual promotion
 - nothing (including DB readers) must write manifests into the target
 
-## Reader note
+## Read replicas
 
 A mirror target is kept as a valid SlateDB database at committed manifests.
-Tailing it as a live read replica depends on SlateDB reader support that does
-not write checkpoints at the target. The detailed design tracks that in
-[RFC 0002](../rfcs/0002-mirroring.md#112-checkpoint-free-reader-slatedb-contribution).
+SlateDB 0.15 `DbReaderMode::FollowLatest` can tail it without writing
+checkpoints at the target. After each manifest commit, Sleet advances the
+target's `gc/manifest.boundary` to make readers with an older cached manifest
+discover the new head across sequence gaps. See
+[RFC 0002](../rfcs/0002-mirroring.md#5-reading-a-mirror) for the protocol and
+retention requirements.

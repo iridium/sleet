@@ -76,8 +76,8 @@ Mirroring builds on three properties of SlateDB's layout:
 Each registered database may name **mirror targets** (§9): destination roots
 the mirror service copies to. A target is a URL, never a registry entry. The
 mirror copies the source's immutable objects to the same relative names
-under the target root and commits manifests as the atomic step. Two
-invariants define a valid target:
+under the target root, commits manifests, then advances the target's
+manifest boundary. Three invariants define a valid target:
 
 1. **Completeness**: the target's latest manifest always has its full
    closure present. The closure is the manifest's own data objects (the L0
@@ -92,26 +92,37 @@ invariants define a valid target:
 2. **Single writer**: the mirror task is the only process that writes
    manifests under the target root. External copiers (§8) write only `wal/`
    and `compacted/`.
+3. **Readable head**: the target's inclusive manifest boundary is always
+   below its highest manifest. After a completed pass at manifest `L`, the
+   boundary is `L - 1`. A checked latest-manifest read therefore rejects
+   every older cached id and accepts `L`.
 
 Completeness makes the target a valid SlateDB database at every instant: the
 latest manifest and every checkpoint-pinned manifest open. Single-writer
 holds because any other manifest committer would fork the target's history
-away from the source.
+away from the source. The readable-head invariant lets
+`DbReaderMode::FollowLatest` cross the gaps in the copied manifest sequence
+(§5).
 
 Never copied: `compactions/` (job claims and epochs are root-local; a
-coordinator later started against the target builds fresh state) and
-`gc/*.boundary` (source-local state; a target has none until it goes live
-and its own GC starts fresh). Zero-byte WAL fence objects are ordinary
-`wal/` objects and copy like any other.
+coordinator later started against the target builds fresh state) and source
+`gc/*.boundary` files (source-local state). Sleet advances the target's
+`gc/manifest.boundary` as derived mirror state; other target boundaries are
+absent until the target goes live and its own services create them.
+Zero-byte WAL fence objects are ordinary `wal/` objects and copy like any
+other.
 
 ## 4. The sync pass
 
 Every mode runs the same pass:
 
 1. **Watermark.** LIST `manifest/` at the target; the highest id `W` is the
-   last committed state. No other state is stored anywhere.
+   last committed state. The target manifest boundary is derived from this
+   watermark, not an independent progress record.
 2. **Read.** Read the source's latest manifest `L`. If `L = W` there is
-   nothing to commit; continuous mode keeps tailing (step 7).
+   nothing to commit. Advance the target manifest boundary to `L - 1`,
+   repairing a crash after a prior manifest commit, and continuous mode
+   keeps tailing (step 7).
 3. **Diff.** Enumerate the closure of `L` (§3): `L`'s data objects and
    those of every manifest a live checkpoint in `L` pins. A live checkpoint
    whose pinned manifest is already gone means the checkpoint was deleted
@@ -147,7 +158,12 @@ Every mode runs the same pass:
    the candidate list (step 3). No manifest commits until the whole closure
    is present.
 5. **Commit.** PUT the closure's manifests in ascending id order, `L` last,
-   each with create-if-absent.
+   each with create-if-absent. After `L` is durable, monotonically advance
+   the target's inclusive manifest boundary to `L - 1` with SlateDB's
+   conditional-update protocol. For `file://` targets, whose object-store
+   adapter has no conditional update, a persistent sidecar lock serializes
+   atomic boundary-file replacement across processes. The ordering keeps a
+   manifest strictly above the boundary at every instant.
 6. **Unpin.** Delete the pin. The deletion writes one more source manifest;
    the next pass commits it through step 3's pinless path, converging `W` to
    the source's head. A pin stands only while data objects copy, so a
@@ -178,24 +194,28 @@ manifest's list and can already race a deletion between listing and opening.
 
 Duplicate mirror tasks are safe. Manifest commits use create-if-absent, and
 a race to write the same source manifest body is not a fork.
-`specs/mirror-race.fizz` pins this: two interleaved passes preserve
-completeness and commit identical bytes on collision.
+Boundary updates are monotonic conditional writes, so an older task cannot
+move the boundary backward and a newer task advances it only after its head
+is complete. `specs/mirror-race.fizz` pins this: two interleaved passes
+preserve completeness and the readable-head invariant, and commit identical
+bytes on collision.
 
 ## 5. Reading a mirror
 
-Replica readers need a checkpoint-free `DbReader` mode that polls the
-target's latest manifest and follows the sequence the mirror commits,
-tolerating the id gaps that are normal there (§3). Read freshness is the
-reader's poll cadence plus mirror lag. SlateDB 0.15.0 adds
-`DbReaderMode::FollowLatest`, but its cached manifest polling treats a
-missing immediate successor as the latest version. It therefore cannot
-advance across a mirror's normal manifest gaps (§11.2). Until that changes,
-readers can mount only explicit checkpoints.
+Replica readers use `DbReaderMode::FollowLatest`. Its cached latest-manifest
+lookup first probes the immediate successor, which may be absent across a
+mirror gap. It then checks the cached id against
+`gc/manifest.boundary`. Once a pass advances the boundary to `L - 1`, every
+older id is rejected, the cache is invalidated, and the retry lists
+`manifest/` to discover `L`. Read freshness is the reader's poll cadence
+plus mirror lag.
 
 Retention sets the read grace. Prune is the only deleter at a target (§7)
 and keeps every restore point for `keep`, so a tailing reader has at least
 `keep` on any manifest it follows; unset retention deletes nothing. `keep`
-must exceed the longest scan a replica runs.
+must exceed the longest scan a replica runs. Specific manifest reads are
+unchecked against the boundary, so retained restore points and explicit
+checkpoints below it remain readable.
 
 For a long-lived consistent snapshot, create a named checkpoint at the
 source: it arrives in the next copied manifest, mounts at the target by id
@@ -256,12 +276,14 @@ source's closure. A crashed pass's pin expires and source GC strips it,
 freeing its orphans to the next prune. The WAL tail above the latest
 manifest is never pruned.
 
-Pruning skips RFC-0026's boundary protocol: a stale task re-creating a
-pruned manifest resurrects harmless litter, below latest and unreachable,
-that the next prune deletes; target commits carry no writer state to lose.
-Unset retention keeps everything. On a continuous target, a short `keep`
-bounds growth at roughly the source's active set plus one `keep` window of
-churn.
+Pruning deletes directly rather than using RFC-0026's boundary-gated delete
+operation. The mirror's manifest boundary already permits every historical
+manifest deletion, and prune still decides which restore points remain. A
+stale task re-creating a pruned manifest resurrects harmless litter, below
+latest and unreachable, that the next prune deletes; target commits carry
+no writer state to lose. Unset retention keeps everything. On a continuous
+target, a short `keep` bounds growth at roughly the source's active set plus
+one `keep` window of churn.
 
 Pruning is the only deletion that may run against a target. SlateDB's own GC
 cannot: it commits manifests (a CAS that strips expired checkpoints), which
@@ -414,14 +436,12 @@ target, preserving target-local state: reader-managed checkpoints, retention
 checkpoints, stock GC. The target becomes a first-class database while data
 objects stay byte-copied. This needs a public manifest write API upstream.
 
-### 11.2 Checkpoint-free reader (SlateDB contribution)
+### 11.2 Boundary-free reader (SlateDB contribution)
 
-Reading a mirror (§5) depends on `DbReaderMode::FollowLatest` tolerating
-gaps in the manifest sequence. SlateDB 0.15.0's initial implementation
-performs no target writes and replays the WAL tail, but its cached latest
-lookup assumes sequenced object IDs are consecutive. The mirror maintains a
-valid but gapped sequence, so the reader needs to fall back to listing when
-its immediate successor is missing.
+The target manifest boundary makes `DbReaderMode::FollowLatest` cross a
+gapped manifest sequence (§5). SlateDB could instead make a missing
+immediate successor fall back to listing. A mirror could then omit the
+mutable target boundary while retaining the same reader behavior.
 
 ### 11.3 Logical mirroring
 

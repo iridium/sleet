@@ -119,7 +119,9 @@ objects itself, invoke `rclone`, or work with cloud replication services.
 Before committing a manifest, Sleet ensures the destination contains every SST
 and checkpoint manifest it references. Each new destination head is loadable
 as soon as it appears. Continuous targets tail the WAL between sync passes.
-Periodic targets create restore points that can be retained and restored later.
+SlateDB 0.15 `DbReaderMode::FollowLatest` readers can tail a destination
+without writing checkpoints there. Periodic targets create restore points that
+can be retained and restored later.
 
 ```toml
 [database]

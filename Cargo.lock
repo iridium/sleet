@@ -3329,6 +3329,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slatedb",
+ "slatedb-txn-obj",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -51,6 +51,18 @@ pub enum MirrorError {
     /// A SlateDB read or checkpoint operation failed.
     #[error(transparent)]
     SlateDb(#[from] slatedb::Error),
+    /// A SlateDB boundary operation failed.
+    #[error(transparent)]
+    TxnObject(#[from] slatedb_txn_obj::TransactionalObjectError),
+    /// A local target's locked boundary update failed.
+    #[error("local manifest boundary update failed at {path}: {source}")]
+    LocalBoundary {
+        /// The boundary or lock path involved.
+        path: std::path::PathBuf,
+        /// The filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// The source has no manifest.
     #[error("{url} is not a SlateDB database (no manifest)")]
     NotADatabase {

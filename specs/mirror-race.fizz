@@ -4,8 +4,8 @@
 # Safety rests on manifest commits using create-if-absent and racing
 # tasks writing identical bytes for the same id (§4: "Duplicate mirror
 # tasks are safe"). This model checks that claim: two tasks run full
-# passes (watermark, diff, pin, copy, ascending commit, unpin) against
-# one source and one target, with the code's racy shape kept:
+# passes (watermark, diff, pin, copy, ascending commit, boundary,
+# unpin) against one source and one target, with the code's racy shape kept:
 # - The commit list is frozen at diff time (pass.rs `present_manifests`),
 #   not re-listed per PUT, so a task PUTs ids a rival already landed and
 #   takes the compare-on-collision path.
@@ -35,6 +35,8 @@
 # - NoDivergence: a commit hitting an existing target manifest id
 #   always finds its own bytes; the Diverged wedge is unreachable
 #   without a foreign writer.
+# - BoundaryOrdered: a boundary update follows its task's completed
+#   manifest commit, and an older task cannot move it backward.
 # - RaceCommitExplored / OverlapExplored / PassRestartExplored: the
 #   id collision, concurrent passes at different heads, and the
 #   vanished-object and vanished-manifest restarts are explored, not
@@ -71,7 +73,7 @@ options:
 deadlock_detection: false
 ---
 
-Phase = enum('IDLE', 'PIN', 'COPY', 'UNPIN')
+Phase = enum('IDLE', 'PIN', 'COPY', 'BOUNDARY', 'UNPIN')
 
 TASKS = ["a", "b"]
 
@@ -175,6 +177,9 @@ action Init:
     dst_m = {}
     dst_objs = set()
     dst_head = None
+    # Abstracts an inclusive numeric boundary of
+    # `dst_refresh_head - 1`, as in mirror.fizz.
+    dst_refresh_head = None
     phase = {}
     wm = {}
     pass_head = {}
@@ -244,20 +249,29 @@ atomic action GcSweep:
 # no candidates everything the commit references is protected without
 # a pin: go straight to the commit steps.
 atomic action PassRead:
-    require src_head != dst_head
+    require src_head != dst_head or dst_refresh_head != dst_head
     t = oneof [x for x in TASKS if phase[x] == Phase.IDLE]
-    d = compute_diff(src_head, dst_head)
-    if not d.ok:
-        restarted = True
-    else:
+    if src_head == dst_head:
+        # Repair a head committed by a rival whose boundary step has
+        # not landed yet.
         wm[t] = dst_head
         pass_head[t] = src_head
-        if len(d.cand) == 0:
-            pending[t] = set()
-            to_commit[t] = d.commits
-            phase[t] = Phase.COPY
+        pending[t] = set()
+        to_commit[t] = []
+        phase[t] = Phase.BOUNDARY
+    else:
+        d = compute_diff(src_head, dst_head)
+        if not d.ok:
+            restarted = True
         else:
-            phase[t] = Phase.PIN
+            wm[t] = dst_head
+            pass_head[t] = src_head
+            if len(d.cand) == 0:
+                pending[t] = set()
+                to_commit[t] = d.commits
+                phase[t] = Phase.COPY
+            else:
+                phase[t] = Phase.PIN
 
 # §4 step 4: create the pin, adopt the manifest its creation commits
 # as L, and rediff against the watermark from pass start. A failed
@@ -364,10 +378,19 @@ atomic action PassCommitOne:
                 dst_head = i
         to_commit[t] = to_commit[t][1:]
         if len(to_commit[t]) == 0:
-            if pass_pin[t] != None:
-                phase[t] = Phase.UNPIN
-            else:
-                phase[t] = Phase.IDLE
+            phase[t] = Phase.BOUNDARY
+
+# §4 step 5: advance the target boundary only after this task's
+# adopted head has committed. The max models SlateDB's monotonic CAS,
+# so a stale task finishing after a newer one cannot move it backward.
+atomic action PassBoundary:
+    t = oneof [x for x in TASKS if phase[x] == Phase.BOUNDARY]
+    if dst_refresh_head == None or pass_head[t] > dst_refresh_head:
+        dst_refresh_head = pass_head[t]
+    if pass_pin[t] != None:
+        phase[t] = Phase.UNPIN
+    else:
+        phase[t] = Phase.IDLE
 
 # §4 step 6: unpin. The deletion writes one more source manifest; the
 # rival (or the next pass) commits it through the pinless path.
@@ -414,6 +437,14 @@ always assertion TargetComplete:
 # foreign writer, which this model does not have.
 always assertion NoDivergence:
     return not diverged
+
+# §3: the concrete boundary is one less than this marker, so a marker
+# no newer than the physical target head proves the boundary remains
+# strictly below a committed manifest.
+always assertion BoundaryOrdered:
+    if dst_refresh_head == None:
+        return True
+    return dst_head != None and dst_refresh_head <= dst_head
 
 # Both tasks mid-pass at different heads at once.
 atomic func overlap_now():
@@ -491,7 +522,7 @@ always assertion TerminalConverged:
             return True
     if src_head != dst_head:
         return True
-    return len(src_m[src_head].cps) == 0
+    return len(src_m[src_head].cps) == 0 and dst_refresh_head == dst_head
 
 # A task in COPY with no copies and no commits left would wedge (no
 # action returns it to IDLE). The diff never produces an empty pass:

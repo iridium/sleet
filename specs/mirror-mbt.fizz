@@ -100,6 +100,8 @@ action Init:
     next_cp = 0
     dst_m = {}
     dst_head = None
+    # Abstracts the concrete `manifest.boundary = dst_refresh_head - 1`.
+    dst_refresh_head = None
     op_cps = []
     writes_left = WRITES
     op_creates_left = OP_CREATES
@@ -184,6 +186,9 @@ atomic action Pass:
     require passes_left > 0
     passes_left = passes_left - 1
     if dst_head == src_head:
+        # A caught-up pass repairs a crash after the manifest commit
+        # but before the boundary update.
+        dst_refresh_head = dst_head
         return "caught-up"
     proven = proven_objects(src_head)
     cl = closure_objects(src_m, src_head)
@@ -194,6 +199,7 @@ atomic action Pass:
         for i in ids:
             dst_m[i] = src_m[i]
         dst_head = src_head
+        dst_refresh_head = dst_head
         return "commit:" + str(len(ids)) + ":nodata"
     # Pin (§4 step 4): the checkpoint pins the manifest its own
     # creation commits, and the pass adopts that manifest as L,
@@ -215,6 +221,7 @@ atomic action Pass:
     for i in ids:
         dst_m[i] = src_m[i]
     dst_head = l
+    dst_refresh_head = dst_head
     # Unpin: one more source manifest without the entry (§4 step 6).
     cps2 = set()
     for e in src_m[l].cps:
@@ -244,3 +251,8 @@ atomic action Prune:
         m2[i] = dst_m[i]
     dst_m = m2
     return "deleted:" + str(deleted) + ":kept:" + str(len(keep))
+
+always assertion BoundaryOrdered:
+    if dst_refresh_head == None:
+        return dst_head == None
+    return dst_head != None and dst_refresh_head <= dst_head

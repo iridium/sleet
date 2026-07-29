@@ -1,19 +1,24 @@
 //! The sync pass (RFC 0002 §4): watermark, read, diff, pin and
-//! copy, commit, unpin, plus the continuous-mode WAL tail (§4 step 7).
+//! copy, commit, boundary, unpin, plus the continuous-mode WAL tail
+//! (§4 step 7).
 //!
 //! The pass syncs the target's watermark `W` directly to the source's
-//! latest manifest `L`. No state is stored anywhere: `W` is recovered
-//! by listing the target's `manifest/` directory. The only source-side
-//! footprint is a pin checkpoint named for the target, held while data
-//! objects copy and deleted the moment the commit lands.
+//! latest manifest `L`. `W` is recovered by listing the target's
+//! `manifest/` directory, and its boundary is derived from `W`. The
+//! only source-side footprint is a pin checkpoint named for the target,
+//! held while data objects copy and deleted the moment the commit lands.
 
 use std::collections::BTreeSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Utc;
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 use slatedb::VersionedManifest;
 use slatedb::config::CheckpointOptions;
+use slatedb_txn_obj::object_store::ObjectStoreBoundaryObject;
+use slatedb_txn_obj::{BoundaryObject, MonotonicId};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -113,7 +118,7 @@ async fn pass_once(
     cache: &mut ManifestCache,
 ) -> Result<PassOutcome, PassError> {
     // 1. Watermark: the target's latest manifest is the last committed
-    // state. No other state is stored anywhere.
+    // state. Its boundary is derived from this watermark.
     let watermark = dest.admin.read_manifest(None).await?;
 
     // 2. Read the source's latest manifest.
@@ -136,6 +141,7 @@ async fn pass_once(
             .into());
         }
         if w.id() == head.id() {
+            advance_target_boundary(dest, head.id()).await?;
             return Ok(PassOutcome {
                 head: head.id(),
                 next_wal_sst_id: head.next_wal_sst_id(),
@@ -359,6 +365,7 @@ async fn commit(
             Err(e) => return Err(e.into()),
         }
     }
+    advance_target_boundary(dest, head.id()).await?;
     info!(
         head = head.id(),
         manifests = committed,
@@ -372,6 +379,107 @@ async fn commit(
         manifests_committed: committed,
         copied,
     })
+}
+
+/// Advance the target's manifest boundary through every id below its
+/// committed head. SlateDB's checked latest read rejects a cached id at
+/// or below this boundary, invalidates its cache, and falls back to a
+/// LIST that crosses the mirror's manifest gaps.
+///
+/// This runs only after the head and its closure have committed. A
+/// caught-up pass repeats it to repair a crash between the final
+/// manifest PUT and this monotonic CAS.
+async fn advance_target_boundary(dest: &DatabaseHandle, head: u64) -> Result<(), MirrorError> {
+    let Some(boundary) = head.checked_sub(1) else {
+        return Ok(());
+    };
+    if let Some(root) = local_root(&dest.url) {
+        advance_local_boundary(root, boundary).await?;
+        debug!(head, boundary, "advanced local mirror manifest boundary");
+        return Ok(());
+    }
+    let object = ObjectStoreBoundaryObject::new(&dest.path, dest.store.clone(), "manifest");
+    object.advance(MonotonicId::new(boundary)).await?;
+    debug!(head, boundary, "advanced mirror manifest boundary");
+    Ok(())
+}
+
+/// Resolve a `file://` database URL to its local root. Other stores use
+/// SlateDB's object-store boundary CAS.
+fn local_root(url: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(url).ok()?;
+    (url.scheme() == "file").then(|| url.to_file_path().ok())?
+}
+
+/// Advance a local target's boundary under an OS file lock. The
+/// `object_store` local backend does not implement conditional updates,
+/// so this provides the same cross-process monotonicity. The boundary
+/// body is replaced from an adjacent synced temporary file, keeping
+/// lock-free SlateDB readers from observing a partial integer.
+async fn advance_local_boundary(root: PathBuf, boundary: u64) -> Result<(), MirrorError> {
+    let boundary_path = root.join("gc").join("manifest.boundary");
+    let error_path = boundary_path.clone();
+    let result =
+        tokio::task::spawn_blocking(move || advance_local_boundary_blocking(&root, boundary))
+            .await
+            .map_err(|error| MirrorError::LocalBoundary {
+                path: error_path.clone(),
+                source: std::io::Error::other(format!("boundary task failed: {error}")),
+            })?;
+    result.map_err(|source| MirrorError::LocalBoundary {
+        path: error_path,
+        source,
+    })
+}
+
+fn advance_local_boundary_blocking(root: &Path, boundary: u64) -> std::io::Result<()> {
+    let gc = root.join("gc");
+    std::fs::create_dir_all(&gc)?;
+    let lock_path = gc.join("manifest.boundary.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock()?;
+
+    let boundary_path = gc.join("manifest.boundary");
+    let current = match std::fs::read_to_string(&boundary_path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    if current >= boundary {
+        return Ok(());
+    }
+
+    let temporary = gc.join(format!(".manifest.boundary.{}.tmp", Uuid::new_v4()));
+    let write = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        write!(file, "{boundary}")?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::rename(&temporary, &boundary_path) {
+            Ok(()) => Ok(()),
+            // Windows does not replace an existing file with rename.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&boundary_path)?;
+                std::fs::rename(&temporary, &boundary_path)
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write
 }
 
 /// The source pin checkpoint one pass holds while data objects copy.
@@ -486,5 +594,32 @@ impl Tail {
             self.next += 1;
             copied += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The file backend has no conditional update, so its OS-locked
+    /// fallback must preserve the same monotonic boundary under racing
+    /// processes or tasks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_boundary_updates_are_monotonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", dir.path().display());
+        let mut tasks = Vec::new();
+        for head in [8, 64, 3, 41, 17, 63, 12, 2] {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                let dest = DatabaseHandle::open(&url).unwrap();
+                advance_target_boundary(&dest, head).await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let value = std::fs::read_to_string(dir.path().join("gc/manifest.boundary")).unwrap();
+        assert_eq!(value, "63");
     }
 }

@@ -1,8 +1,8 @@
 ---
 # sleet's mirror sync protocol (RFC 0002 §3-§4 and §7): a
 # single mirror task runs the sync pass (watermark, diff against the
-# watermark's closure, pin checkpoint, copy, ascending commit, unpin)
-# while a source writer appends manifests, source GC deletes whatever
+# watermark's closure, pin checkpoint, copy, ascending commit and boundary,
+# unpin) while a source writer appends manifests, source GC deletes whatever
 # the latest manifest's live checkpoints no longer protect, the pin
 # can expire mid-pass, operator checkpoints come and go, and the
 # target pruner deletes aged restore points under the design's two
@@ -320,6 +320,11 @@ atomic fair action PassCommit:
     else:
         missing = sorted([i for i in needed if i not in dst_m])
         if len(missing) == 0:
+            # The concrete pass now advances the manifest boundary to
+            # pass_head - 1. At single-task granularity no protocol
+            # action can exploit the crash-safe lag between the final
+            # manifest PUT and that monotonic update, so they share
+            # this transition. The racing-task spec separates them.
             if pass_pin != None:
                 phase = Phase.UNPIN
             else:
