@@ -196,6 +196,8 @@ pub fn gc_options(resolved: &ResolvedGc) -> GarbageCollectorOptions {
                 interval: Some(resolved.detach.interval),
             }),
         metric_level: None,
+        boundary_files_enabled: true,
+        object_store_max_retries: None,
     }
 }
 
@@ -212,11 +214,13 @@ pub fn coordinator_options(resolved: &ResolvedCoordinator) -> CompactorOptions {
         poll_interval: resolved.poll_interval,
         manifest_update_timeout: resolved.manifest_update_timeout,
         max_concurrent_compactions: resolved.max_concurrent_compactions as usize,
+        enable_trivial_move: false,
         scheduler_options: scheduler.into(),
         worker: None,
         metric_level: None,
         commit_compacted_interval: resolved.commit_compacted_interval,
         worker_heartbeat_timeout: resolved.worker_heartbeat_timeout,
+        object_store_max_retries: None,
     }
 }
 
@@ -225,8 +229,7 @@ pub fn worker_options(resolved: &ResolvedWorkers) -> CompactionWorkerOptions {
     CompactionWorkerOptions {
         max_concurrent_compactions: resolved.max_concurrent_compactions as usize,
         compactions_poll_interval: resolved.compactions_poll_interval,
-        heartbeat_bytes: resolved.heartbeat_bytes,
-        heartbeat_min_interval: resolved.heartbeat_min_interval,
+        heartbeat_interval: resolved.heartbeat_interval,
         max_sst_size: resolved.max_sst_size as usize,
         max_fetch_tasks: resolved.max_fetch_tasks as usize,
         bytes_to_fetch: resolved.bytes_to_fetch as usize,
@@ -275,7 +278,7 @@ mod tests {
 
         let worker = worker_options(&resolved.workers);
         assert_eq!(worker.compactions_poll_interval, Duration::from_secs(5));
-        assert_eq!(worker.heartbeat_bytes, 5 * 1024 * 1024);
+        assert_eq!(worker.heartbeat_interval, Duration::from_secs(10));
         assert!(worker.compression_codec.is_none());
     }
 

@@ -41,7 +41,7 @@ percent-encoding = "2.3.2"
 schemars = { version = "1.2.1", features = ["chrono04"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-slatedb = { version = "0.14.1", features = ["aws", "gcp", "azure", "snappy", "zlib", "lz4", "zstd"] }
+slatedb = { version = "0.15.0", features = ["aws", "gcp", "azure", "snappy", "zlib", "lz4", "zstd"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }

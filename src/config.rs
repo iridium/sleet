@@ -339,13 +339,12 @@ pub struct WorkersOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compactions_poll_interval: Option<HumanDuration>,
 
-    /// Bytes a worker must process before emitting a heartbeat.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heartbeat_bytes: Option<u64>,
-
-    /// Minimum wall-clock time between heartbeat writes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heartbeat_min_interval: Option<HumanDuration>,
+    /// How often a worker heartbeats the jobs it owns.
+    #[serde(
+        alias = "heartbeat_min_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub heartbeat_interval: Option<HumanDuration>,
 
     /// Maximum output SST size in bytes before a new one is rolled.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -726,10 +725,8 @@ pub struct ResolvedWorkers {
     pub max_concurrent_compactions: u32,
     /// How often workers poll `.compactions` for `Scheduled` jobs.
     pub compactions_poll_interval: Duration,
-    /// Bytes a worker must process before emitting a heartbeat.
-    pub heartbeat_bytes: u64,
-    /// Minimum wall-clock time between heartbeat writes.
-    pub heartbeat_min_interval: Duration,
+    /// How often a worker heartbeats the jobs it owns.
+    pub heartbeat_interval: Duration,
     /// Maximum output SST size in bytes before a new one is rolled.
     pub max_sst_size: u64,
     /// Concurrent block-fetch tasks per input SST.
@@ -753,8 +750,7 @@ impl Default for ResolvedWorkers {
             count: 1,
             max_concurrent_compactions: 4,
             compactions_poll_interval: Duration::from_secs(5),
-            heartbeat_bytes: 5 * 1024 * 1024,
-            heartbeat_min_interval: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(10),
             max_sst_size: 256 * 1024 * 1024,
             max_fetch_tasks: 4,
             bytes_to_fetch: 2 * 1024 * 1024,
@@ -930,11 +926,8 @@ impl WorkersOverrides {
         if let Some(v) = self.compactions_poll_interval {
             r.compactions_poll_interval = v.0;
         }
-        if let Some(v) = self.heartbeat_bytes {
-            r.heartbeat_bytes = v;
-        }
-        if let Some(v) = self.heartbeat_min_interval {
-            r.heartbeat_min_interval = v.0;
+        if let Some(v) = self.heartbeat_interval {
+            r.heartbeat_interval = v.0;
         }
         if let Some(v) = self.max_sst_size {
             r.max_sst_size = v;
@@ -1241,6 +1234,12 @@ fn check_database(o: &DatabaseConfig, at: &str, errs: &mut Vec<String>) {
             errs.push(format!(
                 "{} must be > 0",
                 loc(at, &format!("{cw}.compactions_poll_interval"))
+            ));
+        }
+        if w.heartbeat_interval.is_some_and(|d| d.0.is_zero()) {
+            errs.push(format!(
+                "{} must be > 0",
+                loc(at, &format!("{cw}.heartbeat_interval"))
             ));
         }
         if w.max_fetch_tasks == Some(0) {

@@ -440,8 +440,8 @@ async fn prune_spares_the_source_closure_and_stops_without_the_source() {
         .await
         .unwrap();
     clock.advance(Duration::from_secs(3600));
-    source_store.fail_all(Op::Get);
-    source_store.fail_all(Op::List);
+    source_store.fail_all_terminal(Op::Get);
+    source_store.fail_all_terminal(Op::List);
     let report = mirror::prune::prune_at(&source, &dest, "dr", &settings, clock.now())
         .await
         .unwrap();
@@ -1584,7 +1584,7 @@ async fn refresh_failure_fails_the_pass_and_heals() {
     // (manifest CAS PUTs) start failing, and so do restart pin
     // deletions and fresh pin creations.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    source_store.fail_all(Op::Put);
+    source_store.fail_all_terminal(Op::Put);
     let result = pass.await.unwrap();
     assert!(result.is_err(), "a pass without a provable pin must fail");
 
@@ -1708,7 +1708,7 @@ async fn replica_reader_mounts_a_mirrored_checkpoint() {
         .unwrap();
 
     let reader = slatedb::DbReader::builder(dest.path.clone(), dest.store.clone())
-        .with_checkpoint_id(snap.id)
+        .with_reader_mode(slatedb::DbReaderMode::Checkpoint(snap.id))
         .build()
         .await
         .unwrap();
@@ -1865,8 +1865,10 @@ async fn broken_target_backs_off_without_hurting_others() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("fleet")).unwrap();
     std::fs::create_dir_all(dir.path().join("good-dst")).unwrap();
+    std::fs::create_dir_all(dir.path().join("bad-dst")).unwrap();
     let fleet_url = format!("file://{}/fleet", dir.path().display());
     let good_dst = format!("file://{}/good-dst", dir.path().display());
+    let bad_dst = format!("file://{}/bad-dst", dir.path().display());
 
     let good_dir = dir.path().join("good");
     let bad_dir = dir.path().join("bad");
@@ -1878,6 +1880,8 @@ async fn broken_target_backs_off_without_hurting_others() {
     seed(&good, 1).await;
     let bad = DatabaseHandle::open(&bad_url).unwrap();
     seed(&bad, 1).await;
+    let diverged = DatabaseHandle::open(&bad_dst).unwrap();
+    seed(&diverged, 3).await;
 
     let root = FleetRoot::open(&fleet_url).unwrap();
     root.store()
@@ -1897,11 +1901,12 @@ async fn broken_target_backs_off_without_hurting_others() {
         )
         .await
         .unwrap();
-    // /dev/null is not a directory: every destination write fails.
+    // The destination is ahead of its source, so the mirror refuses
+    // to join their histories.
     root.store()
         .put(
             &root.database_path(&registry::canonicalize_url(&bad_url).unwrap()),
-            "[mirror.targets.dr]\nurl = \"file:///dev/null/mirror\"\npoll = \"250ms\"\n".into(),
+            format!("[mirror.targets.dr]\nurl = \"{bad_dst}\"\npoll = \"250ms\"\n").into(),
         )
         .await
         .unwrap();

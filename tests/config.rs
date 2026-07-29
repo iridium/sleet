@@ -50,6 +50,7 @@ fn empty_config_resolves_to_builtin_defaults() {
     assert_eq!(r.coordinator.scheduler.max_compaction_sources, 8);
     // SlateDB worker defaults, count=1.
     assert_eq!(r.workers.count, 1);
+    assert_eq!(r.workers.heartbeat_interval, Duration::from_secs(10));
     assert_eq!(r.workers.max_sst_size, 256 * 1024 * 1024);
     assert_eq!(r.workers.compression_codec, None);
 }
@@ -127,6 +128,13 @@ fn config_poll_must_be_positive() {
 fn zero_workers_are_rejected() {
     let msg = config_errors("[database.compaction-workers]\ncount = 0");
     assert!(msg.contains("compaction-workers.count"), "{msg}");
+}
+
+#[test]
+fn old_worker_heartbeat_interval_name_still_parses() {
+    let resolved =
+        config("[database.compaction-workers]\nheartbeat_min_interval = \"17s\"").resolve(None);
+    assert_eq!(resolved.workers.heartbeat_interval, Duration::from_secs(17));
 }
 
 #[test]

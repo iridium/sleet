@@ -100,6 +100,8 @@ struct Faults {
     next: HashMap<Op, u64>,
     /// Fail every call of these ops until healed.
     always: HashMap<Op, bool>,
+    /// Fail every call with a non-retryable error until healed.
+    terminal: HashMap<Op, bool>,
     /// Fail any op with this probability, from a seeded xorshift.
     probability: Option<(f64, u64)>,
     /// Sleep this long before each call of an op (async methods only;
@@ -166,6 +168,15 @@ impl TestStore {
         self.faults.lock().expect("faults").always.insert(op, true);
     }
 
+    /// Fail every call of `op` with a non-retryable error until `heal`.
+    pub fn fail_all_terminal(&self, op: Op) {
+        self.faults
+            .lock()
+            .expect("faults")
+            .terminal
+            .insert(op, true);
+    }
+
     /// Fail any operation with probability `p`, deterministically from
     /// `seed`.
     pub fn fail_probability(&self, p: f64, seed: u64) {
@@ -195,6 +206,9 @@ impl TestStore {
     fn check(&self, op: Op) -> Result<(), object_store::Error> {
         self.counters.bump(op);
         let mut faults = self.faults.lock().expect("faults");
+        if faults.terminal.get(&op).copied().unwrap_or(false) {
+            return Err(terminal_fault(op));
+        }
         if faults.always.get(&op).copied().unwrap_or(false) {
             return Err(fault(op));
         }
@@ -251,6 +265,12 @@ fn fault(op: Op) -> object_store::Error {
     object_store::Error::Generic {
         store: "TestStore",
         source: format!("injected {op:?} fault").into(),
+    }
+}
+
+fn terminal_fault(op: Op) -> object_store::Error {
+    object_store::Error::NotSupported {
+        source: format!("injected terminal {op:?} fault").into(),
     }
 }
 

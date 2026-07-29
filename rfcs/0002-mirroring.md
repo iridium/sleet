@@ -183,14 +183,14 @@ completeness and commit identical bytes on collision.
 
 ## 5. Reading a mirror
 
-Replica readers open the target with `DbReader` in checkpoint-free mode, the
-upstream contribution this RFC depends on (§11.2): the reader polls the
+Replica readers need a checkpoint-free `DbReader` mode that polls the
 target's latest manifest and follows the sequence the mirror commits,
 tolerating the id gaps that are normal there (§3). Read freshness is the
-reader's poll cadence plus mirror lag. 0.14.1's `DbReader` offers only
-explicit checkpoints or a self-managed one it CASes into the manifest, and
-the latter violates single-writer (§3), so until §11.2 lands readers can
-mount only explicit checkpoints.
+reader's poll cadence plus mirror lag. SlateDB 0.15.0 adds
+`DbReaderMode::FollowLatest`, but its cached manifest polling treats a
+missing immediate successor as the latest version. It therefore cannot
+advance across a mirror's normal manifest gaps (§11.2). Until that changes,
+readers can mount only explicit checkpoints.
 
 Retention sets the read grace. Prune is the only deleter at a target (§7)
 and keeps every restore point for `keep`, so a tailing reader has at least
@@ -416,13 +416,12 @@ objects stay byte-copied. This needs a public manifest write API upstream.
 
 ### 11.2 Checkpoint-free reader (SlateDB contribution)
 
-Reading a mirror (§5) depends on an upstream `DbReader` mode that opens at
-the latest manifest with no checkpoint, polls for new manifests, and writes
-nothing. 0.14.1's reader offers only explicit checkpoints or a self-managed
-one committed to the manifest, and the latter violates single-writer (§3).
-The mirror maintains a live manifest sequence at the target, so the mode
-needs no protocol changes. Replaying the WAL tail past the manifest would
-improve freshness from manifest cadence to WAL lag.
+Reading a mirror (§5) depends on `DbReaderMode::FollowLatest` tolerating
+gaps in the manifest sequence. SlateDB 0.15.0's initial implementation
+performs no target writes and replays the WAL tail, but its cached latest
+lookup assumes sequenced object IDs are consecutive. The mirror maintains a
+valid but gapped sequence, so the reader needs to fall back to listing when
+its immediate successor is missing.
 
 ### 11.3 Logical mirroring
 
@@ -458,7 +457,7 @@ target (§3) and would need a flag or a source to judge against.
 
 ## Open questions
 
-1. Resolved: 0.14.1's public `VersionedManifest` accessors cover the
+1. Resolved: SlateDB's public `VersionedManifest` accessors cover the
    closure (the root and segment trees, checkpoints, and the WAL window),
    and Sleet constructs object names itself; the name formats are frozen in
    `src/mirror/layout.rs` and pinned by tests.
