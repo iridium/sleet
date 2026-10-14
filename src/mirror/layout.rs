@@ -201,22 +201,19 @@ impl ManifestObjects {
 
 /// The data objects a manifest references, from its public accessors.
 pub fn manifest_objects(m: &VersionedManifest) -> ManifestObjects {
-    use slatedb::manifest::{SsTableId, SsTableView};
+    use slatedb::manifest::SsTableView;
     let mut objects = ManifestObjects::default();
-    let mut add = |view: &SsTableView| match &view.sst.id {
-        SsTableId::Compacted(ulid) => {
-            objects.compacted.insert(ulid.to_string());
-        }
-        SsTableId::Wal(id) => {
-            objects.wal.insert(*id);
-        }
+    // SlateDB 0.17 views reference only compacted SSTs; WAL SSTs are the
+    // replay range below.
+    let mut add = |view: &SsTableView| {
+        objects.compacted.insert(view.sst.id.value().to_string());
     };
     for (l0, runs) in std::iter::once((m.l0(), m.compacted()))
         .chain(m.segments().iter().map(|s| (s.l0(), s.compacted())))
     {
         l0.iter().for_each(&mut add);
         runs.iter()
-            .flat_map(|run| run.sst_views.iter())
+            .flat_map(|run| run.sst_views().iter())
             .for_each(&mut add);
     }
     for wal_id in (m.replay_after_wal_id() + 1)..m.next_wal_sst_id() {
@@ -231,7 +228,10 @@ pub fn checkpoint_live(cp: &Checkpoint, now: DateTime<Utc>) -> bool {
 }
 
 /// Refuse excluded sources (RFC 0002 §2): clones and databases
-/// with a separate WAL object store.
+/// with a separate WAL object store. SlateDB 0.17 no longer writes
+/// `wal_object_store_uri`, so only manifests from earlier versions
+/// identify the latter; a pass over a newer one stalls on its missing
+/// WAL SSTs instead.
 pub fn check_source(url: &str, m: &VersionedManifest) -> Result<(), MirrorError> {
     if !m.external_dbs().is_empty() {
         return Err(MirrorError::ExcludedSource {

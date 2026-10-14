@@ -40,7 +40,9 @@ and a target URL of `s3://dr-bucket/mirrors` will mirror to
 Without `source_prefix`, `url` is the exact destination for one database.
 
 Mirror sources must be ordinary SlateDB roots. Sleet refuses sources that are
-clones (`external_dbs` is set) or that use a separate WAL object store.
+clones (`external_dbs` is set). Do not register databases that use a separate
+WAL object store: SlateDB 0.17 manifests no longer record that store, so Sleet
+cannot refuse them up front, and their passes fail on the missing WAL SSTs.
 
 Per-database files can opt out or add targets:
 

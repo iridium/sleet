@@ -1569,6 +1569,9 @@ async fn soak_mirror_races_live_compaction_and_gc() {
 
 /// §2: excluded sources are refused. A clone (external_dbs set) and a
 /// database with a separate WAL object store cannot be mirror sources.
+/// SlateDB 0.17 manifests no longer record the WAL store, so the latter
+/// is not refused up front; its pass fails on the WAL SSTs missing from
+/// the main store instead of committing.
 #[tokio::test(flavor = "multi_thread")]
 async fn excluded_sources_are_refused() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -1615,7 +1618,7 @@ async fn excluded_sources_are_refused() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, mirror::MirrorError::ExcludedSource { ref reason, .. } if reason.contains("WAL")),
+        matches!(err, mirror::MirrorError::Stalled { ref reason, .. } if reason.contains("/wal/")),
         "{err:?}"
     );
 }

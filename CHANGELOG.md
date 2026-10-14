@@ -4,6 +4,12 @@ All notable changes to Sleet are documented in this file.
 
 ## Unreleased
 
+- Upgrade SlateDB to 0.17.0. Against databases written by SlateDB 0.17, the
+  0.15 build rewrote the source manifest in the V1 format when creating mirror
+  pin checkpoints, dropping the SST view IDs that 0.17 compactors assign. SlateDB 0.17 manifests no longer record a
+  separate WAL object store, so such sources are no longer refused up front;
+  their passes stall on the missing WAL SSTs.
+
 - Add a checksum-verified installer for prebuilt Linux and macOS CLI releases.
 - Upgrade SlateDB to 0.15.0. Compaction workers now use
   `heartbeat_interval`; `heartbeat_min_interval` remains a config alias, and

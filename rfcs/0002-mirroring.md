@@ -57,7 +57,9 @@ The target's highest manifest id is the watermark.
 - The fleet root (`sleet.toml`, `dbs/`, `nodes/`) is not mirrored;
   mirroring is per database.
 - Databases that are clones (`external_dbs` set) or that use a separate WAL
-  object store cannot be mirror sources (§11.4).
+  object store cannot be mirror sources (§11.4). SlateDB 0.17 manifests no
+  longer record a separate WAL store, so such a source is not refused up
+  front; its passes stall on the WAL SSTs missing from the main store.
 
 ## 3. Model
 

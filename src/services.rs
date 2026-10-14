@@ -209,6 +209,7 @@ pub fn coordinator_options(resolved: &ResolvedCoordinator) -> CompactorOptions {
         min_compaction_sources: resolved.scheduler.min_compaction_sources as usize,
         max_compaction_sources: resolved.scheduler.max_compaction_sources as usize,
         include_size_threshold: resolved.scheduler.include_size_threshold,
+        ..Default::default()
     };
     CompactorOptions {
         poll_interval: resolved.poll_interval,
@@ -221,6 +222,7 @@ pub fn coordinator_options(resolved: &ResolvedCoordinator) -> CompactorOptions {
         commit_compacted_interval: resolved.commit_compacted_interval,
         worker_heartbeat_timeout: resolved.worker_heartbeat_timeout,
         object_store_max_retries: None,
+        ..Default::default()
     }
 }
 
